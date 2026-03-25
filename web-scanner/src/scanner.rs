@@ -1,10 +1,10 @@
 use crate::model::{Finding, ScanJob, ScanStatus};
 use reqwest::Client;
 use scraper::{Html, Selector};
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashSet, VecDeque, HashMap};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-use std::collections::HashMap;
+use url::Url;
 
 pub async fn run_scan(scan_id: String, target: String, db: Arc<Mutex<HashMap<String, ScanJob>>>) {
     let client = Client::builder()
@@ -28,10 +28,17 @@ pub async fn run_scan(scan_id: String, target: String, db: Arc<Mutex<HashMap<Str
         pages_crawled += 1;
 
         println!("Scanning: {}", url);
+        
+        // --- 1. Basic Reflected XSS Check (URL Parameters) ---
+        if url.contains('?') {
+            check_reflected_xss(&client, &url, &mut all_findings).await;
+        }
+
         match client.get(&url).send().await {
             Ok(response) => {
                 println!("Got response {} for {}", response.status(), url);
-                // Check headers
+                
+                // --- 2. Security Headers Analysis ---
                 let headers = response.headers();
                 let missing_headers = ["strict-transport-security", "content-security-policy", "x-frame-options", "x-content-type-options"];
                 
@@ -47,7 +54,7 @@ pub async fn run_scan(scan_id: String, target: String, db: Arc<Mutex<HashMap<Str
                 }
 
                 if let Ok(text) = response.text().await {
-                    // Parse links
+                    // --- 3. Parse Links for Crawler ---
                     let document = Html::parse_document(&text);
                     if let Ok(selector) = Selector::parse("a") {
                         for element in document.select(&selector) {
@@ -56,7 +63,7 @@ pub async fn run_scan(scan_id: String, target: String, db: Arc<Mutex<HashMap<Str
                                 if href.starts_with(&target) && !visited.contains(href) {
                                     visited.insert(href.to_string());
                                     queue.push_back(href.to_string());
-                                } else if href.starts_with("/") {
+                                } else if href.starts_with('/') {
                                     let absolute_url = format!("{}{}", target.trim_end_matches('/'), href);
                                     if !visited.contains(&absolute_url) {
                                         visited.insert(absolute_url.clone());
@@ -64,6 +71,18 @@ pub async fn run_scan(scan_id: String, target: String, db: Arc<Mutex<HashMap<Str
                                     }
                                 }
                             }
+                        }
+                    }
+
+                    // --- 4. Looking for Forms (Future XSS/CSRF testing) ---
+                    if let Ok(form_selector) = Selector::parse("form") {
+                        if document.select(&form_selector).count() > 0 {
+                            all_findings.push(Finding {
+                                url: url.clone(),
+                                vulnerability: "FormFound".to_string(),
+                                severity: "LOW".to_string(),
+                                evidence: format!("Found {} form(s) on this page. Potential for XSS/SQLi.", document.select(&form_selector).count()),
+                            });
                         }
                     }
                 }
@@ -94,7 +113,6 @@ pub async fn run_scan(scan_id: String, target: String, db: Arc<Mutex<HashMap<Str
             
             if let Ok(response) = client.get(&enum_url).send().await {
                 let status = response.status();
-                // If the status is 200 OK, 401 Unauthorized, or 403 Forbidden, the path likely exists.
                 if status.is_success() || status == 401 || status == 403 {
                     all_findings.push(Finding {
                         url: enum_url.clone(),
@@ -105,8 +123,6 @@ pub async fn run_scan(scan_id: String, target: String, db: Arc<Mutex<HashMap<Str
                 }
             }
         }
-    } else {
-        println!("Skipping Directory Enumeration because target is offline.");
     }
 
     // Update DB
@@ -114,5 +130,57 @@ pub async fn run_scan(scan_id: String, target: String, db: Arc<Mutex<HashMap<Str
     if let Some(job) = lock.get_mut(&scan_id) {
         job.status = ScanStatus::Done;
         job.findings = all_findings;
+    }
+}
+
+async fn check_reflected_xss(client: &Client, url_str: &str, findings: &mut Vec<Finding>) {
+    let mut url = match Url::parse(url_str) {
+        Ok(u) => u,
+        Err(_) => return,
+    };
+
+    let params: Vec<(String, String)> = url.query_pairs().map(|(k, v)| (k.into_owned(), v.into_owned())).collect();
+    if params.is_empty() {
+        return;
+    }
+
+    // Common XSS payload
+    let payload = "<script>alert('xss')</script>";
+
+    for (i, (key, _)) in params.iter().enumerate() {
+        let mut test_params = params.clone();
+        test_params[i].1 = payload.to_string();
+
+        // Reconstruct URL with injected payload
+        url.set_query(None);
+        {
+            let mut query = url.query_pairs_mut();
+            for (k, v) in test_params {
+                query.append_pair(&k, &v);
+            }
+        }
+
+        let test_url = url.to_string();
+        if let Ok(resp) = client.get(&test_url).send().await {
+            // Check if Content-Type is HTML-ish
+            let is_html = resp.headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|v| v.to_str().ok())
+                .map(|v| v.contains("text/html"))
+                .unwrap_or(false);
+
+            if is_html {
+                if let Ok(text) = resp.text().await {
+                    if text.contains(payload) {
+                        findings.push(Finding {
+                            url: url_str.to_string(),
+                            vulnerability: "ReflectedXSS".to_string(),
+                            severity: "HIGH".to_string(),
+                            evidence: format!("Query parameter '{}' is reflected in the response without sanitization. Payload: {}", key, payload),
+                        });
+                    }
+                }
+            }
+        }
     }
 }

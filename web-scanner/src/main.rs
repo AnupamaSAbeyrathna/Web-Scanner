@@ -10,7 +10,7 @@ use axum::{
     Json, Router,
 };
 use model::{ScanJob, ScanStatus};
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use uuid::Uuid;
