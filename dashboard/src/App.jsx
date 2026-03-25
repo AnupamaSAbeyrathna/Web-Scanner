@@ -12,8 +12,10 @@ const severityColor = (s) => {
 };
 
 const vulnIcon = (v) => {
+  if (v === "ReflectedXSS") return "💉";
   if (v === "MissingHeader") return "🛡️";
   if (v === "DirectoryEnumeration") return "📂";
+  if (v === "FormFound") return "📝";
   if (v === "ConnectionError") return "🔌";
   return "⚠️";
 };
